@@ -41,6 +41,8 @@ import gzip
 import networkx as nx
 import re
 from contextlib import contextmanager
+import pickle
+import os
 
 # Tell pycapnp to search for schema files inside the
 # FPGA Interchange Schema repository
@@ -60,16 +62,20 @@ class NxRoutingGraph(nx.DiGraph):
         """
 
         # Clock Region X2Y1 (requires ~5GB RAM)
-        MIN_X = 36
-        MAX_X = 56
-        MIN_Y = 60
-        MAX_Y = 119
+        #MIN_X = 36
+        #MAX_X = 56
+        #MIN_Y = 60
+        #MAX_Y = 119
+        MIN_X = 60
+        MAX_X = 70
+        MIN_Y = 169
+        MAX_Y = 200
 
         # Entire device (requires ~40GB RAM)
-        # MIN_X = 0
-        # MAX_X = sys.maxsize
-        # MIN_Y = 0
-        # MAX_Y = sys.maxsize
+        #MIN_X = 0
+        #MAX_X = sys.maxsize
+        #MIN_Y = 0
+        #MAX_Y = sys.maxsize
 
         class CustomEdgeAttribute:
                 """By default, networkx uses a dict object as the container for all edge attributes.
@@ -318,7 +324,13 @@ class NxRouter:
 
         def __init__(self, deviceResourcesFilename):
                 self.G = NxRoutingGraph()
-                self.G.build(deviceResourcesFilename)
+                if os.path.isfile("polynomial.graph"):
+                        infile = open("polynomial.graph", "rb")
+                        self.G = pickle.load(infile)
+                else:
+                        self.G.build(deviceResourcesFilename)
+                        outfile = open("polynomial.graph", "wb")
+                        pickle.dump(self.G, outfile)
 
         def parse(self, netlist):
                 tstart = time.time()
