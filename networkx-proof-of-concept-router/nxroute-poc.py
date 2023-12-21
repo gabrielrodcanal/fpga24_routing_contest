@@ -345,6 +345,8 @@ class NxRouter:
 
                 s = self.netlist.strList
                 for net in self.netlist.physNets:
+                        if net.type != 'signal':
+                                print(net.type)
                         assert len(net.stubNodes) == 0
 
                         sinkPins = self.extractSitePins(net.stubs)
@@ -408,8 +410,8 @@ class NxRouter:
                 print('\tPrepare site pins: %.1fs' % (tend-tstart))
 
 
-        def route_net(self, netName, sourcePin2node, sinkNodes, used_nodes):
-                numPinsRouted = 0
+        def route_net(self, netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes, numPinsRouted, edges_to_check_for_max_weight):
+                #numPinsRouted = 0
                 hiddenEdges = []
                 s = self.netlist.strList
                 nodes = self.G.nodes
@@ -417,13 +419,27 @@ class NxRouter:
                 sourceNodes = sourcePin2node.values()
                 multiSink = len(sinkNodes) > 1
 
+
                 for sinkNode in sinkNodes:
                         path = None
+
                         for sourceNode in sourceNodes:
                                 try:
-                                        path = nx.shortest_path(self.G, sourceNode, sinkNode)
+                                        unweighed_path = nx.shortest_path(self.G, sourceNode, sinkNode)
+                                        path = nx.dijkstra_path(self.G, sourceNode, sinkNode, 'weight')
+                                        #for path in nx.shortest_simple_paths(self.G, sourceNode, sinkNode):
+                                        if path[0] in used_nodes:
+                                                print("CONFLICT! NET NUMBER ", numPinsRouted)
+                                                continue
+
+                                        for u, v in zip(path[:-1], path[1:]):
+                                                if v in used_nodes:
+                                                        print("CONFLICT! NET NUMBER ", numPinsRouted)
+                                                        break
+
                                 except nx.NetworkXNoPath:
                                         continue
+
                                 break
 
                         if not path:
@@ -432,10 +448,29 @@ class NxRouter:
                                 continue
 
                         numHiddenEdges = len(hiddenEdges)
+                        for edge in self.G.in_edges(path[0]):
+                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                        for edge in self.G.out_edges(path[0]):
+                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                        used_nodes.add(path[0])
+
                         for u, v in zip(path[:-1], path[1:]):
                                 # Key the next node of the path with the net name
                                 nodes[u].setdefault(netName, set()).add(v)
                                 used_nodes.add(v)  # Add the used node to the set
+                                if v in net_used_nodes:
+                                        net_used_nodes[v].append(netName)
+                                else:
+                                        net_used_nodes[v] = [netName]
+
+                                self.G[u][v]['weight'] = MAX_WEIGHT
+                                for edge in self.G.in_edges(v):
+                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                                for edge in self.G.out_edges(v):
+                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+
+                                edges_to_check_for_max_weight.add((u,v))
+
 
                                 if multiSink:
                                         hiddenEdges.extend(
@@ -450,44 +485,35 @@ class NxRouter:
                                 print('\tRouted %d pins: %.1fs' % (numPinsRouted, tend - tstart))
 
                 for u, v, d in hiddenEdges:
-                        self.G.add_edge(u, v, pip=d['pip'])
+                        self.G.add_edge(u, v, pip=d['pip'], weight=1)
                 hiddenEdges.clear()
 
                 return numPinsRouted
 
-        def check_conflicts(self):
-                used_nodes = set()
-                for net, (sourcePin2node, sinkNodes) in self.net2pin2node.items():
-                        self.route_net(net, sourcePin2node, sinkNodes, used_nodes)
-
-                # Check for conflicts
-                conflicts = []
-                for net, (sourcePin2node, sinkNodes) in self.net2pin2node.items():
-                        for sinkNode in sinkNodes:
-                                if sinkNode in used_nodes:
-                                        conflicts.append((net, sinkNode))
-
-                if conflicts:
-                        print("Conflicts found:")
-                        for net, node in conflicts:
-                                print(f"Net: {net}, Node: {node}")
-
         def route(self):
                 tstart = time.time()
                 totalPinsToRoute = sum(len(sinkNodes) for (_, sinkNodes) in self.net2pin2node.values())
-                print(f'Routing {totalPinsToRoute} pins...')
+                print('Routing %d pins...' % totalPinsToRoute)
 
                 numPinsRouted = 0
 
+                # Track used nodes during routing
+                used_nodes = set()
+                net_used_nodes = dict()
+                edges_to_check_for_max_weight = set()
+
                 # Route all nets
                 for netName, (sourcePin2node, sinkNodes) in self.net2pin2node.items():
-                        numPinsRouted += self.route_net(netName, sourcePin2node, sinkNodes, set())
+                        numPinsRouted = self.route_net(netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes, numPinsRouted, edges_to_check_for_max_weight)
 
-                # Check conflicts after routing all nets
-                self.check_conflicts()
+                        # Net number 10 has a conflict. No conflicts before that
+                        if numPinsRouted == 17:
+                                break
+
 
                 tend = time.time()
-                print(f'\tRouted {numPinsRouted} pins: {tend - tstart:.1f}s')
+                print('\tRouted %d pins: %.1fs' % (numPinsRouted, tend - tstart))
+
 
         def write(self, filename):
                 print('Writing design...')
