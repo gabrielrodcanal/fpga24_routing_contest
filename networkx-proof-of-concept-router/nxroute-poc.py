@@ -305,9 +305,6 @@ class NxRouter:
 
         @contextmanager
         def create(deviceResourcesFilename, physNetlistFilename):
-                """Return a with-statement context manager instance of NxRouter
-                   with the routing graph built and the design parsed"""
-                router = NxRouter(deviceResourcesFilename)
 
                 print('Parsing design...')
                 tstart = time.time()
@@ -317,12 +314,43 @@ class NxRouter:
                 # Load 'DeviceResources.capnp'
                 import PhysicalNetlist_capnp
                 with PhysicalNetlist_capnp.PhysNetlist.from_bytes(data, traversal_limit_in_words=sys.maxsize, nesting_limit=2**16) as netlist:
+                        MAX_X = 0
+                        MIN_X = 999999
+                        MAX_Y = 0
+                        MIN_Y = 999999
+
+                        for res in netlist.strList:
+                                match_dim = re.search("[A-Z]+_X([0-9]+)Y([0-9]+)", res)
+                                if match_dim:
+                                        X = int(match_dim.group(1))
+                                        Y = int(match_dim.group(2))
+
+                                        if X > MAX_X:
+                                                MAX_X = X
+                                        elif X < MIN_X:
+                                                MIN_X = X
+                                        if Y > MAX_Y:
+                                                MAX_Y = Y
+                                        if Y < MIN_Y:
+                                                MIN_Y = Y
+                        print(MIN_X, MAX_X, MIN_Y, MAX_Y)
+
+                        """Return a with-statement context manager instance of NxRouter
+                           with the routing graph built and the design parsed"""
+
+                        router = NxRouter(deviceResourcesFilename, MIN_X, MAX_X, MIN_Y, MAX_Y)
+
                         tend = time.time()
                         print('\tRead PhysicalNetlist: %.1fs' % (tend-tstart))
                         router.parse(netlist)
                         yield router
 
-        def __init__(self, deviceResourcesFilename):
+        def __init__(self, deviceResourcesFilename, MIN_X, MAX_X, MIN_Y, MAX_Y):
+                self.MIN_X = MIN_X
+                self.MAX_X = MAX_X
+                self.MIN_Y = MIN_Y
+                self.MAX_Y = MAX_Y
+
                 self.G = NxRoutingGraph()
                 if os.path.isfile("polynomial.graph"):
                         infile = open("polynomial.graph", "rb")
