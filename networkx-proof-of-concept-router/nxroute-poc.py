@@ -40,11 +40,16 @@ import capnp
 import gzip
 import networkx as nx
 import re
+import resource
 from contextlib import contextmanager
+import pickle
+import os
 
 # Tell pycapnp to search for schema files inside the
 # FPGA Interchange Schema repository
 sys.path.append('fpga-interchange-schema/interchange')
+
+MAX_WEIGHT = 999999
 
 class NxRoutingGraph(nx.DiGraph):
         """NetworkX-based Routing Graph
@@ -60,12 +65,12 @@ class NxRoutingGraph(nx.DiGraph):
         """
 
         # Clock Region X2Y1 (requires ~5GB RAM)
-        MIN_X = 36
-        MAX_X = 56
-        MIN_Y = 60
-        MAX_Y = 119
+        MIN_X = 60
+        MAX_X = 70
+        MIN_Y = 169
+        MAX_Y = 200
 
-        # Entire device (requires ~40GB RAM)
+        # Entire device (requires ~50GB RAM)
         # MIN_X = 0
         # MAX_X = sys.maxsize
         # MIN_Y = 0
@@ -87,7 +92,7 @@ class NxRoutingGraph(nx.DiGraph):
                         if key == 'pip':
                                 return (self.tile,self.pipDataIndex)
                         raise KeyError(key)
-        edge_attr_dict_factory = CustomEdgeAttribute
+        #edge_attr_dict_factory = CustomEdgeAttribute
 
         class CustomNodeAttribute:
                 """By default, networkx uses a dict object as the container for all node attributes.
@@ -147,7 +152,7 @@ class NxRoutingGraph(nx.DiGraph):
                         tend = time.time()
                         print('\tRead DeviceResources: %.1fs' % (tend-tstart))
                         tstart = time.time()
-                        s = device.strList
+                        s = CachedTextList(device.strList)
 
                         # Build a dictionary of all in-bounds tiles
                         tileNames = set()
@@ -232,14 +237,14 @@ class NxRoutingGraph(nx.DiGraph):
                                         pipDataIndex = pipData2indexSetdefault((wire0Name,wire1Name,forward), len(pipData))
                                         if pipDataIndex == len(pipData):
                                                 pipData.append((s[wire0Name],s[wire1Name],forward))
-                                        add_edge(node0Idx, node1Idx, pip=(tileName,pipDataIndex))
+                                        add_edge(node0Idx, node1Idx, pip=(tileName,pipDataIndex), weight=1)
                                         # Add reverse edge for bidirectional PIPs
                                         if not pip.directional:
                                                 forward = False
                                                 pipDataIndex = pipData2indexSetdefault((wire0Name,wire1Name,forward), len(pipData))
                                                 if pipDataIndex == len(pipData):
                                                         pipData.append((s[wire0Name],s[wire1Name],forward))
-                                                add_edge(node1Idx, node0Idx, pip=(tileName,pipDataIndex))
+                                                add_edge(node1Idx, node0Idx, pip=(tileName,pipDataIndex), weight=1)
                         tend = time.time()
                         print('\tBuild %d graph edges: %.1fs' % (self.number_of_edges(),tend-tstart))
 
@@ -255,23 +260,22 @@ class NxRoutingGraph(nx.DiGraph):
                                         pinNames = siteTypePinNames[siteType.primaryType]
                                         for pinIndex,wireName in enumerate(siteType.primaryPinsToTileWires):
                                                 pinName = pinNames[pinIndex]
-                                                self.tileType2SiteTypePinName2wire.setdefault(tileTypeIdx, {})[siteTypeIdx,pinName] = wireName
+                                                self.tileType2SiteTypePinName2wire.setdefault(tileTypeIdx, {})[siteTypeIdx,pinName] = s[wireName]
 
                         # Build self.site2tileAndTypes
-                        tileList = device.tileList
-                        tile2wire2node = self.tile2wire2node
                         for tile in tiles:
                                 if not tile.sites:
                                         continue
                                 for site in tile.sites:
                                         siteName = s[site.name]
-                                        self.site2tileAndTypes[siteName] = (tile.name,tile.type,site.type)
+                                        tileName = s[tile.name]
+                                        self.site2tileAndTypes[siteName] = (tileName,tile.type,site.type)
 
-                                # Keep only site pin wires in self.tile2wire2node
-                                siteTypePinName2wire = self.tileType2SiteTypePinName2wire[tile.type]
-                                sitePinWires = set(siteTypePinName2wire.values())
-                                wire2node = {k:v for k,v in tile2wire2node[tile.name].items() if k in sitePinWires}
-                                tile2wire2node[tile.name] = wire2node
+                        # Convert self.tile2wire2node from having integer keys to string keys
+                        # so that it can be used without access to device.strList
+                        self.tile2wire2node = {s[k]: {s[k2]:v2
+                                for k2,v2 in v.items()}
+                                for k,v in self.tile2wire2node.items()}
                         tend = time.time()
                         print('\tBuild lookups: %.1fs' % (tend-tstart))
 
@@ -320,7 +324,13 @@ class NxRouter:
 
         def __init__(self, deviceResourcesFilename):
                 self.G = NxRoutingGraph()
-                self.G.build(deviceResourcesFilename)
+                if os.path.isfile("polynomial.graph"):
+                        infile = open("polynomial.graph", "rb")
+                        self.G = pickle.load(infile)
+                else:
+                        self.G.build(deviceResourcesFilename)
+                        outfile = open("polynomial.graph", "wb")
+                        pickle.dump(self.G, outfile)
 
         def parse(self, netlist):
                 tstart = time.time()
@@ -330,12 +340,13 @@ class NxRouter:
                 # (b) list of sink nodes
                 self.net2pin2node = {}
 
-                s = self.netlist.strList
+                s = CachedTextList(netlist.strList)
+
                 for net in self.netlist.physNets:
                         assert len(net.stubNodes) == 0
-
-                        sinkPins = self.extractSitePins(net.stubs)
                         if net.type == 'signal' and net.stubs:
+                                sinkPins = self.extractSitePins(net.stubs)
+
                                 # Net is a signal net (not vcc/gnd) and
                                 # has some stub branches (unrouted site pins)
                                 if not sinkPins:
@@ -383,16 +394,119 @@ class NxRouter:
 
                                 self.net2pin2node[net.name] = (sourcePin2node,sinkNodes)
                         else:
-                                # This net either has no stubs (fully routed) or it is a gnd/vcc net
-                                # Remove all its site pin nodes from the routing graph so that they can't
-                                # be used by other nets (otherwise Vivado reports a site pin conflict)
-                                for sp in self.extractSitePins(net.sources) + sinkPins:
-                                        siteName,sinkName = s[sp.site],s[sp.pin]
-                                        blockedNode = self.G.getNodeFromSitePin(siteName, sinkName)
-                                        if blockedNode is not None:
-                                                self.G.remove_node(blockedNode)
+                                # This is a non-signal net (i.e. gnd/vcc) or it has no routing
+                                # stubs (meaning it is fully routed). Walk its routing tree
+                                # to identify all used routing resources and remove them from
+                                # the routing graph so that no other nets will conflict.
+
+                                tile2wire2nodeGet = self.G.tile2wire2node.get
+                                queue = list(net.sources)
+                                while queue:
+                                        rb = queue.pop()
+                                        rs = rb.routeSegment
+                                        if rs.which() == 'pip':
+                                                # Remove driven node from graph so no other nets can drive it
+                                                pip = rs.pip
+                                                wire2node = tile2wire2nodeGet(s[pip.tile])
+                                                if wire2node:
+                                                        blockedNode = wire2node.get(s[pip.wire1 if pip.forward else pip.wire0])
+                                                        if blockedNode is not None:
+                                                                self.G.remove_node(blockedNode)
+                                                else:
+                                                        # Tile must be out of bounds
+                                                        pass
+                                        queue.extend(rb.branches)
+                del self.G.tileType2SiteTypePinName2wire
+                del self.G.site2tileAndTypes
+                del self.G.tile2wire2node
                 tend = time.time()
                 print('\tPrepare site pins: %.1fs' % (tend-tstart))
+
+        def route_net(self, netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes, numPinsRouted, edges_to_check_for_max_weight):
+                hiddenEdges = []
+                nodes = self.G.nodes
+                s = self.netlist.strList
+
+                sourceNodes = sourcePin2node.values()
+                multiSink = len(sinkNodes) > 1
+
+                blocked_nodes_lst = []
+                conflict = False
+                for sinkNode in sinkNodes:
+                        path = None
+                        # For every sink node, try all source nodes until one with a routing
+                        # path is found
+                        # Note that nx.shortest_path() only accepts a single source node; other
+                        # implementations may wish to consider all sources simultaneously
+                        for sourceNode in sourceNodes:
+                                conflict = False
+                                try:
+                                        for path in nx.shortest_simple_paths(self.G, sourceNode, sinkNode, 'weight'):
+                                                for u, v in zip(path[:-1], path[1:]):
+                                                        if v in used_nodes:
+                                                                print("CONFLICT! NET NUMBER ", numPinsRouted)
+                                                                conflict = True
+                                                                break
+                                                if conflict:
+                                                        continue
+                                                else:
+                                                        break
+                                except nx.NetworkXNoPath:
+                                        continue
+                                break
+                        if not path:
+                                print('Unable to route sink pin ' + str(nodes[sinkNode]['sp']) + ' on net ' + s[
+                                        netName])
+                                continue
+                        if conflict is True:
+                                print("-----> CONFLICT WASN'T SOLVED")
+
+                        for edge in self.G.in_edges(path[0]):
+                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                        for edge in self.G.out_edges(path[0]):
+                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                        used_nodes.add(path[0])
+                            
+                            
+                        numHiddenEdges = len(hiddenEdges)
+                        for u, v in zip(path[:-1], path[1:]):
+                                # Key the next node of the path with the net name
+                                nodes[u].setdefault(netName, set()).add(v)
+                                
+                                used_nodes.add(v)  # Add the used node to the set
+                                if v in net_used_nodes:
+                                        net_used_nodes[v].append(netName)
+                                else:
+                                        net_used_nodes[v] = [netName]
+
+                                self.G[u][v]['weight'] = MAX_WEIGHT
+                                for edge in self.G.in_edges(v):
+                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+                                for edge in self.G.out_edges(v):
+                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
+
+                                edges_to_check_for_max_weight.add((u,v))
+
+                                if multiSink:
+                                        # In order to prevent nodes with two different drivers from the same
+                                        # net (breaking the requirement that a net's routing has to be a tree)
+                                        # temporarily remove all incoming edges of used nodes
+                                        # Note that trees from different nets may drive the same node, causing an overlap
+                                        hiddenEdges.extend(
+                                                [edge for edge in self.G.in_edges(v, data=True) if edge[0] != u])
+                        if hiddenEdges:
+                                self.G.remove_edges_from(hiddenEdges[numHiddenEdges:])
+                        numPinsRouted += 1
+                        if numPinsRouted % 10000 == 0:
+                                tend = time.time()
+                                print('\tRouted %d pins: %.1fs' % (numPinsRouted, tend - tstart))
+                # After routing all sinks of this net, restore all temporarily hidden
+                # edges so that they are available for other nets to use
+                for u, v, d in hiddenEdges:
+                        self.G.add_edge(u, v, pip=d['pip'], weight=1)
+                hiddenEdges.clear()
+
+                return numPinsRouted
 
         def route(self):
                 tstart = time.time()
@@ -400,48 +514,20 @@ class NxRouter:
                 print('Routing %d pins...' % totalPinsToRoute)
 
                 numPinsRouted = 0
-                hiddenEdges = []
-                s = self.netlist.strList
-                nodes = self.G.nodes
+                
+                # Track used nodes during routing
+                used_nodes = set()
+                net_used_nodes = dict()
+                edges_to_check_for_max_weight = set()
+                
                 for netName,(sourcePin2node,sinkNodes) in self.net2pin2node.items():
-                        sourceNodes = sourcePin2node.values()
-                        multiSink = len(sinkNodes) > 1
-                        for sinkNode in sinkNodes:
-                                path = None
-                                # For every sink node, try all source nodes until one with a routing
-                                # path is found
-                                # Note that nx.shortest_path() only accepts a single source node; other
-                                # implementations may wish to consider all sources simultaneously
-                                for sourceNode in sourceNodes:
-                                        try:
-                                                path = nx.shortest_path(self.G, sourceNode, sinkNode)
-                                        except nx.NetworkXNoPath:
-                                                continue
-                                        break
-                                if not path:
-                                        print('Unable to route sink pin ' + str(nodes[sinkNode]['sp']) + ' on net ' + s[netName])
-                                        continue
-                                numHiddenEdges = len(hiddenEdges)
-                                for u,v in zip(path[:-1],path[1:]):
-                                        # Key the next node of the path with the net name
-                                        nodes[u].setdefault(netName, set()).add(v)
-                                        if multiSink:
-                                                # In order to prevent nodes with two different drivers from the same
-                                                # net (breaking the requirement that a net's routing has to be a tree)
-                                                # temporarily remove all incoming edges of used nodes
-                                                # Note that trees from different nets may drive the same node, causing an overlap
-                                                hiddenEdges.extend([edge for edge in self.G.in_edges(v, data=True) if edge[0] != u])
-                                if hiddenEdges:
-                                        self.G.remove_edges_from(hiddenEdges[numHiddenEdges:])
-                                numPinsRouted += 1
-                                if numPinsRouted % 10000 == 0:
-                                        tend = time.time()
-                                        print('\tRouted %d pins: %.1fs' % (numPinsRouted,tend-tstart))
-                        # After routing all sinks of this net, restore all temporarily hidden
-                        # edges so that they are available for other nets to use
-                        for u,v,d in hiddenEdges:
-                                self.G.add_edge(u, v, pip=d['pip'])
-                        hiddenEdges.clear()
+                        numPinsRouted = self.route_net(netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes,
+                                                       numPinsRouted, edges_to_check_for_max_weight)
+
+                        ## Net number 10 has a conflict. No conflicts before that
+                        #if numPinsRouted == 17:
+                        #        break
+
                 tend = time.time()
                 print('\tRouted %d pins: %.1fs' % (numPinsRouted,tend-tstart))
 
@@ -576,6 +662,18 @@ class NxRouter:
         def getStringIndex(self, string):
                 return self.strings.setdefault(string, len(self.strings))
 
+class CachedTextList:
+        """Drop-in class for wrapping capnp's 'List<Text>' objects where
+           gotten strings are cached rather than deep copied on each lookup"""
+        def __init__(self, s):
+                self.s = s
+                self.i = [None] * len(s)
+        def __getitem__(self, k):
+                v = self.i[k]
+                if v is None:
+                        v = self.i[k] = self.s[k]
+                return v
+
 
 if len(sys.argv) != 3:
         print('USAGE: <unrouted.phys> <routed.phys>')
@@ -584,3 +682,5 @@ if len(sys.argv) != 3:
 with NxRouter.create('xcvu3p.device', sys.argv[1]) as router:
         router.route()
         router.write(sys.argv[2])
+
+print('Peak memory:', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, 'KB')
