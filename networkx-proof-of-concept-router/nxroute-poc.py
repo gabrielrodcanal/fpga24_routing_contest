@@ -44,12 +44,22 @@ import resource
 from contextlib import contextmanager
 import pickle
 import os
+import queue
+from dataclasses import dataclass, field
+from typing import Any
 
 # Tell pycapnp to search for schema files inside the
 # FPGA Interchange Schema repository
 sys.path.append('fpga-interchange-schema/interchange')
 
 MAX_WEIGHT = 999999
+
+
+@dataclass(order=True)
+class PrioritizedItem:
+        priority: int
+        item: Any = field(compare=False)
+
 
 class NxRoutingGraph(nx.DiGraph):
         """NetworkX-based Routing Graph
@@ -125,7 +135,7 @@ class NxRoutingGraph(nx.DiGraph):
                         return self._read().get(key, default)
                 def __contains__(self, key):
                         return key in self._read()
-        node_attr_dict_factory = CustomNodeAttribute
+        #node_attr_dict_factory = CustomNodeAttribute
 
         def build(self, filename):
                 print('Building routing graph...')
@@ -183,7 +193,7 @@ class NxRoutingGraph(nx.DiGraph):
                                 if baseWire.tile not in tileNames:
                                         # Node is in an out-of-bounds tile
                                         continue
-                                add_node(nodeIdx)
+                                add_node(nodeIdx, cost=0, p=1, h=0, x=0, b=0)
                                 for wireIdx in node.wires:
                                         wire = wires[wireIdx]
                                         tileName = wire.tile
@@ -334,6 +344,15 @@ class NxRouter:
                                         if Y < MIN_Y:
                                                 MIN_Y = Y
                         print(MIN_X, MAX_X, MIN_Y, MAX_Y)
+                        #MIN_X = 64
+                        #MAX_X = 66
+                        #MIN_Y = 177
+                        #MAX_Y = 184
+
+                        MIN_X = 50
+                        MAX_X = 80
+                        MIN_Y = 140
+                        MAX_Y = 200
 
                         """Return a with-statement context manager instance of NxRouter
                            with the routing graph built and the design parsed"""
@@ -450,114 +469,133 @@ class NxRouter:
                 tend = time.time()
                 print('\tPrepare site pins: %.1fs' % (tend-tstart))
 
-        def route_net(self, netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes, numPinsRouted, edges_to_check_for_max_weight):
-                hiddenEdges = []
-                nodes = self.G.nodes
-                s = self.netlist.strList
 
-                sourceNodes = sourcePin2node.values()
-                multiSink = len(sinkNodes) > 1
-
-                blocked_nodes_lst = []
-                conflict = False
-                for sinkNode in sinkNodes:
-                        path = None
-                        # For every sink node, try all source nodes until one with a routing
-                        # path is found
-                        # Note that nx.shortest_path() only accepts a single source node; other
-                        # implementations may wish to consider all sources simultaneously
-                        for sourceNode in sourceNodes:
-                                conflict = False
-                                try:
-                                        for path in nx.shortest_simple_paths(self.G, sourceNode, sinkNode, 'weight'):
-                                                for u, v in zip(path[:-1], path[1:]):
-                                                        if v in used_nodes:
-                                                                print("CONFLICT! NET NUMBER ", numPinsRouted)
-                                                                conflict = True
-                                                                break
-                                                if conflict:
-                                                        continue
-                                                else:
-                                                        break
-                                except nx.NetworkXNoPath:
-                                        continue
-                                break
-                        if not path:
-                                print('Unable to route sink pin ' + str(nodes[sinkNode]['sp']) + ' on net ' + s[
-                                        netName])
-                                continue
-                        if conflict is True:
-                                print("-----> CONFLICT WASN'T SOLVED")
-
-                        for edge in self.G.in_edges(path[0]):
-                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
-                        for edge in self.G.out_edges(path[0]):
-                                self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
-                        used_nodes.add(path[0])
-                            
-                            
-                        numHiddenEdges = len(hiddenEdges)
-                        for u, v in zip(path[:-1], path[1:]):
-                                # Key the next node of the path with the net name
-                                nodes[u].setdefault(netName, set()).add(v)
-                                
-                                used_nodes.add(v)  # Add the used node to the set
-                                if v in net_used_nodes:
-                                        net_used_nodes[v].append(netName)
-                                else:
-                                        net_used_nodes[v] = [netName]
-
-                                self.G[u][v]['weight'] = MAX_WEIGHT
-                                for edge in self.G.in_edges(v):
-                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
-                                for edge in self.G.out_edges(v):
-                                        self.G[edge[0]][edge[1]]['weight'] = MAX_WEIGHT
-
-                                edges_to_check_for_max_weight.add((u,v))
-
-                                if multiSink:
-                                        # In order to prevent nodes with two different drivers from the same
-                                        # net (breaking the requirement that a net's routing has to be a tree)
-                                        # temporarily remove all incoming edges of used nodes
-                                        # Note that trees from different nets may drive the same node, causing an overlap
-                                        hiddenEdges.extend(
-                                                [edge for edge in self.G.in_edges(v, data=True) if edge[0] != u])
-                        if hiddenEdges:
-                                self.G.remove_edges_from(hiddenEdges[numHiddenEdges:])
-                        numPinsRouted += 1
-                        if numPinsRouted % 10000 == 0:
-                                tend = time.time()
-                                print('\tRouted %d pins: %.1fs' % (numPinsRouted, tend - tstart))
-                # After routing all sinks of this net, restore all temporarily hidden
-                # edges so that they are available for other nets to use
-                for u, v, d in hiddenEdges:
-                        self.G.add_edge(u, v, pip=d['pip'], weight=1)
-                hiddenEdges.clear()
-
-                return numPinsRouted
+        def nodes_summary(nodes):
+                for n in nodes:
+                        print(f"NODE {n}. COST: {nodes[n]['cost']}. P: {nodes[n]['p']}. H: {nodes[n]['h']}")
 
         def route(self):
-                tstart = time.time()
-                totalPinsToRoute = sum(len(sinkNodes) for (_,sinkNodes) in self.net2pin2node.values())
-                print('Routing %d pins...' % totalPinsToRoute)
+                nodes = self.G.nodes
 
-                numPinsRouted = 0
-                
-                # Track used nodes during routing
-                used_nodes = set()
-                net_used_nodes = dict()
-                edges_to_check_for_max_weight = set()
-                
-                for netName,(sourcePin2node,sinkNodes) in self.net2pin2node.items():
-                        numPinsRouted = self.route_net(netName, sourcePin2node, sinkNodes, used_nodes, net_used_nodes,
-                                                       numPinsRouted, edges_to_check_for_max_weight)
+                for node in nodes:
+                        nodes[node]['b'] = len(self.G.edges(node))
 
-                        ## Net number 10 has a conflict. No conflicts before that
-                        #if numPinsRouted == 17:
-                        #        break
+                routing_tree_nodes = {}
 
-                tend = time.time()
-                print('\tRouted %d pins: %.1fs' % (numPinsRouted,tend-tstart))
+                conflict = True
+                while conflict:
+                        conflict = False
+
+                        nodes_in_routes = set()
+
+                        partial_path_cost = dict()
+
+                        # Keeps track of the nets in which a node is a parent. Used to detect routing conflicts between nets
+                        parents_in_net = dict()
+                        # Keeps track of the parent of each node in the explored path. It enables the backtracking phase, this way we
+                        # know which of the incoming edges is the parent
+
+                        net_number = 0
+
+                        p_base = 0
+                        for netName, (sourcePin2node, sinkNodes) in self.net2pin2node.items():
+                                if netName in routing_tree_nodes:
+                                        for node in routing_tree_nodes[netName]:
+                                                nodes[node]['x'] = 0
+                                                nodes[node]['netName'] = set()
+
+                        shared_nodes = set()
+
+                        for netName, (sourcePin2node, sinkNodes) in self.net2pin2node.items():
+                                net_number += 1
+                                sourceNodes = sourcePin2node.values()
+                                sourceNode = list(sourceNodes)[0]
+
+                                # Rip net routing tree
+                                routing_tree_nodes[netName] = set()
+
+                                pq = queue.PriorityQueue()
+                                pq.put(PrioritizedItem(0, sourceNode))
+
+                                partial_path_cost[sourceNode] = 0
+                                parent_in_path = dict()
+
+                                path_found = True
+                                for sinkNode in sinkNodes:
+                                        net_nodes = set()
+
+                                        for node in routing_tree_nodes[netName]:
+                                                pq.put(PrioritizedItem(0, node))
+                                                net_nodes.add(node)
+
+                                        path_nodes = set()
+
+                                        while True:
+                                                if pq.empty():
+                                                        path_found = False
+                                                        print("COULD NOT FIND PATH")
+                                                        break
+                                                else:
+                                                        m = pq.get()
+
+                                                net_nodes.add(m.item)
+                                                path_nodes.add(m.item)
+
+                                                if m.item == sinkNode:
+                                                        break
+
+                                                # Calculate path cost up to this node
+                                                for parent_m, _ in self.G.in_edges(m.item):
+                                                        if parent_m in partial_path_cost:
+                                                                partial_path_cost[m.item] = partial_path_cost[
+                                                                                    parent_m] + nodes[m.item]['cost']
+
+                                                for _, child in self.G.out_edges(m.item):
+                                                        if child not in net_nodes:
+                                                                child_priority = nodes[child]['cost'] + \
+                                                                                 partial_path_cost[m.item]
+                                                                pq.put(PrioritizedItem(child_priority, child))
+                                                                parent_in_path[child] = m.item
+
+                                        # Backtracking: generate path + update costs
+                                        routing_tree_nodes[netName].add(sinkNode)
+                                        current_node = sinkNode
+
+                                        if path_found:
+                                                while current_node != sourceNode:
+                                                        parent = parent_in_path[current_node]
+
+                                                        if parent in parents_in_net:
+                                                                nodes[parent]['x'] += 1
+                                                                nodes[parent]['p'] = (1 + nodes[parent]['x'] * p_base)
+
+                                                                parents_in_net[parent].append(netName)
+                                                                shared_nodes.add(parent)
+                                                        else:
+                                                                nodes[parent]['x'] = 1
+                                                                nodes[parent]['p'] = (1 + nodes[parent]['x'] * p_base)
+                                                                parents_in_net[parent] = [netName]
+                                                                shared_nodes.add(parent)
+
+                                                        nodes[parent]['cost'] = (nodes[parent]['b'] +
+                                                                                 nodes[parent]['h']) * \
+                                                                                nodes[parent]['p']
+
+                                                        nodes[parent].setdefault(netName, set()).add(current_node)
+                                                        routing_tree_nodes[netName].add(parent)
+                                                        current_node = parent
+
+                                        pq = queue.PriorityQueue()
+
+                                if nodes_in_routes.intersection(routing_tree_nodes[netName]):
+                                        conflict = True
+                                nodes_in_routes = nodes_in_routes.union(routing_tree_nodes[netName])
+
+                                for node in shared_nodes:
+                                        nodes[node]['h'] += 0.3
+
+                        p_base += 0.3
+                        iter += 1
 
         def write(self, filename):
                 print('Writing design...')
